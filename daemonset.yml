@@ -1,0 +1,126 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd-daemonset
+spec:
+  selector:
+    matchLabels:
+      name: fluentd-pod
+  template:
+    metadata:
+      labels:
+        name: fluentd-pod
+    spec:
+      containers:
+        - name: fluentd-container
+          image: #fluent/fluentd-kubernetes-daemonset:v1.12.0-debian-elasticsearch7-1.0
+          image: alpine
+          command: ["sh", "-c", "tail -f /dev/null"]
+          volumeMounts:
+            - name: config-volume
+              mountPath: /config
+      volumes:
+        - name: config-volume
+          configMap:
+            name: fluentd-configmap
+            items:
+              - key: config
+                path: fluentd.conf
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-configmap
+data:
+  config: |-
+    <source>
+      @type tail
+      path "/var/log/containers/*_nginx-container-*.log"
+      pos_file /var/log/nginx-container.log.pos
+      tag nginx
+      read_from_head true
+      <parse>
+        @type json
+        time_format %Y-%m-%dT%H:%M:%S.%NZ
+      </parse>
+    </source>
+
+    # logの値の末尾に\nがつくので削除する
+    <filter nginx>
+      @type record_transformer
+      enable_ruby
+      <record>
+        log ${record["log"].strip}
+      </record>
+    </filter>
+
+    # 標準出力と標準エラーでtagを分ける
+    <match nginx>
+      @type rewrite_tag_filter
+      <rule>
+          key     stream
+          pattern /^stdout$/
+          tag     "${tag}.stdout"
+      </rule>
+      <rule>
+          key     stream
+          pattern /^stderr$/
+          tag     "${tag}.stderr"
+      </rule>
+    </match>
+    
+    # jsonのlog値にコンテナが出力ログが入っているのでを取り出す
+    <filter nginx.stdout>
+      @type parser
+      key_name log
+      <parse>
+        @type ltsv
+        keep_time_key true
+        types status:integer, req_time:float, runtime:float, app_time:float, res_size:integer, req_size:integer
+      </parse>
+    </filter>
+
+    <filter nginx.stderr>
+      @type parser
+      key_name log
+      <parse>
+        @type none
+      </parse>
+    </filter>
+
+    # S3に保存する
+    <match nginx.stdout>
+      @type s3
+      format json
+      s3_bucket "#{ENV['S3_BUCKET_NAME']}"
+      s3_region ap-northeast-1
+      s3_object_key_format "${tag[0]}-log/%{time_slice}/${tag[0]}-%{index}.log.%{file_extension}"
+      time_slice_format year=%Y/month=%m/day=%d/hour=%H
+      <buffer tag,time>
+        @type file
+        path "/var/log/fluentd-buffers/s3.buffer"
+        timekey 3600
+        timekey_wait 10m
+        timekey_use_utc true
+        chunk_limit_size 1G
+        flush_at_shutdown true
+      </buffer>
+    </match>
+
+    <match nginx.stderr>
+      @type s3
+      format single_value
+      s3_bucket "#{ENV['S3_BUCKET_NAME']}"
+      s3_region ap-northeast-1
+      s3_object_key_format "${tag[0]}-error-log/%{time_slice}/${tag[0]}-error-%{index}.log.%{file_extension}"
+      time_slice_format year=%Y/month=%m/day=%d/hour=%H
+      <buffer tag,time>
+        @type file
+        path "/var/log/fluentd-buffers/s3-error.buffer"
+        timekey 3600
+        timekey_wait 10m
+        timekey_use_utc true
+        chunk_limit_size 1G
+        flush_at_shutdown true
+      </buffer>
+    </match>
